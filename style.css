@@ -1,0 +1,17 @@
+/**
+ * Chat Name Extension Styles
+ * Minimal styling for the chat name input field
+ */
+
+#chat_name_block {
+    margin-bottom: 10px;
+}
+
+#chat_name_block label {
+    display: block;
+    margin-bottom: 5px;
+}
+
+#chat_name_input {
+    width: 100%;
+}
