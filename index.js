@@ -1,20 +1,3 @@
-/**
- * Chat Name Extension for SillyTavern
- * 
- * Allows setting a separate "Character Name" for chat display and {{char}} macro
- * that differs from the card name.
- * 
- * Use Case:
- * - JanitorAI imports often have descriptive card names: "Merrick | The Fool's Gambit"
- * - This extension lets you use "Merrick" in chat/prompts while keeping the full card name
- * 
- * Storage:
- * - Chat name stored in: character.data.extensions['chat-name'].chatName
- * 
- * @author Your Name
- * @version 1.0.0
- */
-
 (function() {
     'use strict';
     
@@ -24,8 +7,8 @@
     
     const EXTENSION_NAME = 'chat-name';
     const LOG_PREFIX = '[chat-name]';
-    const INIT_TIMEOUT = 10000; // 10 seconds max wait for context
-    const INIT_CHECK_INTERVAL = 100; // Check every 100ms
+    const INIT_TIMEOUT = 10000;
+    const INIT_CHECK_INTERVAL = 100;
     
     // ============================================================================
     // State
@@ -33,308 +16,349 @@
     
     let initialized = false;
     let eventListenersAttached = false;
+    let chatObserver = null;
+    let nameCache = new Map(); // Cache chatName by character avatar/name
+    let processedMessages = new WeakSet(); // Track messages with persistent name overrides
+    let pendingUpdates = new Set(); // Set of message IDs pending name update
     
     // ============================================================================
     // Utility Functions
     // ============================================================================
     
-    /**
-     * Get SillyTavern context
-     * @returns {Object|null} SillyTavern context or null
-     */
+    // Get SillyTavern context
     function getContext() {
         return window.SillyTavern?.getContext?.() ?? null;
     }
     
-    /**
-     * Get current character
-     * @returns {Object|null} Character object or null
-     */
-    function getCurrentCharacter() {
+    // Get character data for a character's avatar key or name
+    function getCharacterForMessage(message) {
         const ctx = getContext();
-        if (!ctx || ctx.characterId === undefined) {
-            return null;
+        if (!ctx || !ctx.characters || !message) return null;
+        
+        const avatar = message.avatar || message.force_avatar || message.original_avatar;
+        const name = (message.name || '').trim();
+
+        // Helper to normalize avatar string for comparison
+        const normalizeAvatar = (str) => {
+            if (!str) return '';
+            // Remove path and query params, but keep filename with extension
+            let normalized = str.split('/').pop().split('?')[0];
+            return decodeURIComponent(normalized);
+        };
+
+        const normalizedAvatar = normalizeAvatar(avatar);
+
+        // 1. Try matching by normalized avatar
+        if (normalizedAvatar) {
+            const avatarMatch = ctx.characters.find(c => normalizeAvatar(c.avatar) === normalizedAvatar);
+            if (avatarMatch) return avatarMatch;
         }
+
+        // 2. Try matching by original_avatar (fallback for group chats)
+        if (message.original_avatar) {
+            const normOrig = normalizeAvatar(message.original_avatar);
+            const originalMatch = ctx.characters.find(c => normalizeAvatar(c.avatar) === normOrig);
+            if (originalMatch) return originalMatch;
+        }
+        
+        // 3. Try matching by name (exact match fallback)
+        if (name) {
+            const nameMatch = ctx.characters.find(c => c.name === name);
+            if (nameMatch) return nameMatch;
+            
+            // 3b. Try fuzzy name match (one contains the other) - helps with "Name - Filename" cases
+            const fuzzyMatch = ctx.characters.find(c => {
+                const charName = (c.name || '').trim();
+                return charName.length > 2 && (name.includes(charName) || charName.includes(name));
+            });
+            if (fuzzyMatch) return fuzzyMatch;
+        }
+
+        // 4. Last resort fallback for 1-on-1 chats: use current character
+        if (ctx.characterId !== undefined && !ctx.groupId) {
+            return ctx.characters[ctx.characterId] ?? null;
+        }
+        
+        return null;
+    }
+
+    // Get the character currently selected for editing/sidebar
+    function getSelectedCharacter() {
+        const ctx = getContext();
+        if (!ctx || ctx.characterId === undefined) return null;
         return ctx.characters[ctx.characterId] ?? null;
     }
     
-    /**
-     * Get chat name for current character, fallback to card name
-     * @returns {string} Chat name or card name
-     */
-    function getChatName() {
-        const char = getCurrentCharacter();
-        if (!char) {
-            return '';
-        }
-        
-        const chatName = char.data?.extensions?.[EXTENSION_NAME]?.chatName;
-        const trimmedChatName = chatName?.trim();
-        
-        return trimmedChatName || char._originalName || char.name || '';
+    // Get chat name for a specific character object, fallback to card name
+    function getChatName(character) {
+        if (!character) return '';
+        const customName = character.data?.extensions?.[EXTENSION_NAME]?.chatName;
+        return customName?.trim() || character.name || '';
     }
     
     // ============================================================================
     // UI Functions
     // ============================================================================
     
-    /**
-     * Add chat name input field to character editor
-     */
-    function addInputField() {
-        // Prevent duplicates
-        if (document.getElementById('chat_name_input')) {
-            return;
+    // Apply persistent .name property override on a message object
+    function applyPersistentName(message, chatName) {
+        if (!message || processedMessages.has(message) || !chatName) return;
+
+        try {
+            let originalName = message.name;
+            Object.defineProperty(message, 'name', {
+                get: () => chatName || originalName,
+                set: (val) => { originalName = val; },
+                configurable: true,
+                enumerable: true
+            });
+            processedMessages.add(message);
+        } catch (e) {
+            message.name = chatName; // Fallback
         }
+    }
+
+    // Sync naming data across SillyTavern's memory
+    function syncChatData() {
+        const ctx = getContext();
+        if (!ctx || !ctx.chat) return;
+
+        // 1. Override name2 (current character) for 1-on-1 chats
+        if (ctx.characterId !== undefined && !ctx.groupId) {
+            const char = ctx.characters[ctx.characterId];
+            const chatName = getChatName(char);
+            if (chatName && ctx.name2 !== chatName) {
+                window.SillyTavern.getContext().name2 = chatName;
+            }
+        }
+
+        // 2. Override all messages in the chat array
+        ctx.chat.forEach((message, id) => {
+            if (!message || message.is_user || message.is_system) return;
+            
+            const cacheKey = message.avatar || message.force_avatar || message.original_avatar || message.name;
+            let chatName = nameCache.get(cacheKey);
+            
+            if (chatName === undefined) {
+                const character = getCharacterForMessage(message);
+                chatName = getChatName(character);
+                if (cacheKey) nameCache.set(cacheKey, chatName);
+            }
+
+            if (chatName) {
+                applyPersistentName(message, chatName);
+                updateUIName(id);
+            }
+        });
+    }
+
+    // Update chat bubble name text in the DOM
+    function updateUIName(messageId) {
+        const ctx = getContext();
+        if (!ctx || !ctx.chat) return;
+
+        const message = ctx.chat[messageId];
+        if (!message || message.is_user || message.is_system) return;
+
+        const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+        if (messageElement) {
+            applyNameOverrideToElement(messageElement, message.name);
+        }
+    }
+
+    // Apply the override to a specific message DOM element
+    function applyNameOverrideToElement(messageElement, chatName) {
+        const selectors = ['.ch_name .name_text', '.mes_header .name', '.ch_name', '.name_text', '.mes_name', '.mesHeader_name', '.ch_name span', '.mes_header span'];
+        
+        for (const selector of selectors) {
+            const nameElement = messageElement.querySelector(selector);
+            if (nameElement) {
+                if (nameElement.children.length === 0) {
+                    if (nameElement.textContent !== chatName) nameElement.textContent = chatName;
+                    break;
+                } else {
+                    for (const child of nameElement.childNodes) {
+                        if (child.nodeType === Node.TEXT_NODE && child.textContent.trim().length > 0) {
+                            if (child.textContent.trim() !== chatName) child.textContent = chatName;
+                            return; // Found and updated
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan all messages and update names
+    function updateAllNames() {
+        nameCache.clear();
+        syncChatData();
+    }
+
+    // Setup MutationObserver to watch for chat updates
+    function setupChatObserver() {
+        const chatContainer = document.getElementById('chat');
+        if (!chatContainer || chatObserver) return;
+
+        chatObserver = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                let target = mutation.target;
+                if (target.nodeType === Node.TEXT_NODE) target = target.parentElement;
+                if (!target) continue;
+
+                const messageElement = target.closest?.('.mes') || (mutation.addedNodes[0]?.closest?.('.mes'));
+                if (messageElement) {
+                    const mesId = messageElement.getAttribute('mesid');
+                    if (mesId !== null) updateUIName(Number(mesId));
+                }
+            }
+        });
+
+        chatObserver.observe(chatContainer, { childList: true, subtree: true, characterData: true });
+        console.log(LOG_PREFIX, 'Chat observer started');
+    }
+
+    // Add input field to the character editor sidebar
+    function addInputField() {
+        if (document.getElementById('chat_name_input')) return;
         
         const tagsDiv = document.querySelector('#tags_div');
-        if (!tagsDiv) {
-            console.warn(LOG_PREFIX, 'Cannot find #tags_div element');
-            return;
-        }
+        if (!tagsDiv) return;
         
         const fieldHTML = `
             <div id="chat_name_block">
-                <label for="chat_name_input">
-                    <small>Character Name (for chat/{{char}})</small>
-                </label>
-                <input id="chat_name_input" 
-                       class="text_pole" 
-                       type="text" 
-                       placeholder="Leave empty to use card name" 
-                       maxlength="100" />
+                <label for="chat_name_input"><small>Character Name (for {{char}})</small></label>
+                <input id="chat_name_input" class="text_pole" type="text" placeholder="Leave empty to use card name" maxlength="100" />
             </div>
         `;
-        
         tagsDiv.insertAdjacentHTML('beforebegin', fieldHTML);
         
-        // Attach event listener
         const input = document.getElementById('chat_name_input');
         if (input) {
-            input.addEventListener('input', handleInputChange);
+            input.addEventListener('input', () => {
+                const ctx = getContext();
+                if (ctx && ctx.characterId !== undefined) {
+                    ctx.writeExtensionField(ctx.characterId, EXTENSION_NAME, { chatName: input.value });
+                }
+            });
             loadChatNameToField();
         }
     }
     
-    /**
-     * Handle input field changes
-     */
-    function handleInputChange() {
-        const ctx = getContext();
-        const input = document.getElementById('chat_name_input');
-        
-        if (!ctx || ctx.characterId === undefined || !input) {
-            return;
-        }
-        
-        // Save to character extension data
-        ctx.writeExtensionField(ctx.characterId, EXTENSION_NAME, {
-            chatName: input.value
-        });
-    }
-    
-    /**
-     * Load chat name into input field
-     */
+    // Load stored chat name into the editor input field
     function loadChatNameToField() {
         const input = document.getElementById('chat_name_input');
-        if (!input) {
-            return;
-        }
+        if (!input) return;
         
-        const char = getCurrentCharacter();
-        if (!char) {
-            input.value = '';
-            return;
-        }
-        
-        input.value = char.data?.extensions?.[EXTENSION_NAME]?.chatName || '';
+        const char = getSelectedCharacter();
+        input.value = char?.data?.extensions?.[EXTENSION_NAME]?.chatName || '';
     }
     
     // ============================================================================
-    // Macro Override
+    // Core Overrides
     // ============================================================================
     
-    /**
-     * Hook the character's name property ONLY for macro substitution
-     * Uses a call stack check to avoid affecting chat naming
-     */
-    function hookCharacterName() {
-        const char = getCurrentCharacter();
-        if (!char) {
-            return;
+    // Ensure the custom name is used during prompt build (fallback for name2)
+    function handleGenerateBeforePrompt(data) {
+        const selectedChar = getSelectedCharacter();
+        const chatName = getChatName(selectedChar);
+        if (chatName && data.name2) {
+            data.name2 = chatName;
         }
-        
-        // Don't re-hook if already hooked
-        if (char._chatNameHooked) {
-            return;
-        }
-        
-        // Store original name
-        if (!char._originalName) {
-            char._originalName = char.name;
-        }
-        
-        // Define property with smart getter/setter
-        Object.defineProperty(char, 'name', {
-            get: function() {
-                // Check if we're being called from macro substitution
-                const stack = new Error().stack;
-                const isFromMacros = stack && (
-                    stack.includes('evaluateMacros') ||
-                    stack.includes('substituteParams') ||
-                    stack.includes('MacrosParser')
-                );
-                
-                // Only return chat name if called from macro system
-                if (isFromMacros) {
-                    const chatName = this.data?.extensions?.[EXTENSION_NAME]?.chatName;
-                    const trimmedChatName = chatName?.trim();
-                    if (trimmedChatName) {
-                        return trimmedChatName;
-                    }
-                }
-                
-                // Otherwise return original name (for chat naming, UI, etc)
-                return this._originalName;
-            },
-            set: function(value) {
-                this._originalName = value;
-            },
-            configurable: true,
-            enumerable: true
-        });
-        
-        char._chatNameHooked = true;
     }
-    
-    /**
-     * Register {{char}} macro in available macro systems
-     * This is a fallback for systems that don't use the character object
-     */
+
+    // Register {{char}} macro overrides
     function registerMacroOverrides() {
         const ctx = getContext();
-        if (!ctx) {
-            return;
-        }
+        if (!ctx) return;
         
-        // Method 1: New macro system (experimental macro engine)
-        if (window.macros?.registry) {
+        const nameGetter = () => getChatName(getSelectedCharacter());
+
+        // New Macro Engine
+        if (ctx.macros) {
             try {
-                if (window.macros.registry.hasMacro('char')) {
-                    window.macros.registry.unregisterMacro('char');
-                }
-                window.macros.registry.registerMacro('char', {
+                if (ctx.macros.registry.hasMacro('char')) ctx.macros.registry.unregisterMacro('char');
+                ctx.macros.registry.registerMacro('char', {
                     category: 'core',
-                    description: 'Character name (overridden by chat-name extension)',
-                    handler: getChatName,
+                    description: 'Character name override',
+                    handler: nameGetter,
                 });
-                console.log(LOG_PREFIX, 'Registered in new macro system');
-            } catch (error) {
-                console.warn(LOG_PREFIX, 'Failed to register in new macro system:', error);
+
+                if (ctx.macros.envBuilder?.registerProvider) {
+                    ctx.macros.envBuilder.registerProvider((env) => {
+                        const name = nameGetter();
+                        if (name) env.names.char = name;
+                    });
+                }
+            } catch (e) {
+                console.warn(LOG_PREFIX, 'Macro registration failed', e);
             }
         }
         
-        // Method 2: Old deprecated system for compatibility
+        // Legacy Macro System
         if (ctx.registerMacro) {
             try {
-                ctx.registerMacro('char', getChatName);
-                console.log(LOG_PREFIX, 'Registered in old macro system');
-            } catch (error) {
-                console.warn(LOG_PREFIX, 'Failed to register in old macro system:', error);
-            }
+                ctx.registerMacro('char', nameGetter);
+            } catch (e) {}
         }
-        
-        // Method 3: Hook character name (most reliable for macro substitution)
-        hookCharacterName();
     }
     
     // ============================================================================
-    // Event Handlers
+    // Lifecycle
     // ============================================================================
     
-    /**
-     * Handle character or chat changes
-     */
     function handleCharacterChange() {
         addInputField();
         loadChatNameToField();
-        hookCharacterName();
+        updateAllNames();
+        setupChatObserver();
     }
     
-    /**
-     * Attach event listeners
-     * @param {Object} ctx - SillyTavern context
-     */
     function attachEventListeners(ctx) {
-        if (eventListenersAttached || !ctx.eventSource || !ctx.event_types) {
-            return;
-        }
+        if (eventListenersAttached || !ctx.eventSource || !ctx.eventTypes) return;
+        const events = ctx.eventSource;
+        const types = ctx.eventTypes;
+
+        // Data-level sync for persistence
+        events.on(types.CHARACTER_MESSAGE_RENDERED, syncChatData);
+        events.on(types.MESSAGE_UPDATED, syncChatData);
+        events.on(types.MESSAGE_RECEIVED, syncChatData);
+        events.on(types.STREAM_TOKEN_RECEIVED, syncChatData);
         
-        ctx.eventSource.on(ctx.event_types.CHAT_CHANGED, handleCharacterChange);
-        ctx.eventSource.on(ctx.event_types.CHARACTER_SELECTED, handleCharacterChange);
+        events.on(types.GENERATE_BEFORE_COMBINE_PROMPTS, handleGenerateBeforePrompt);
+        events.on(types.CHAT_CHANGED, handleCharacterChange);
+        events.on(types.CHARACTER_SELECTED, handleCharacterChange);
         
         eventListenersAttached = true;
     }
     
-    // ============================================================================
-    // Initialization
-    // ============================================================================
-    
-    /**
-     * Initialize the extension
-     * @param {Object} ctx - SillyTavern context
-     */
     function initialize(ctx) {
-        if (initialized) {
-            return;
-        }
-        
-        console.log(LOG_PREFIX, 'Initializing extension...');
-        
-        // Add UI field
+        if (initialized) return;
         addInputField();
-        
-        // Register macro overrides
         registerMacroOverrides();
-        
-        // Attach event listeners
         attachEventListeners(ctx);
-        
+        setupChatObserver();
+        updateAllNames();
         initialized = true;
-        console.log(LOG_PREFIX, 'Extension initialized successfully');
+        console.log(LOG_PREFIX, 'Initialized');
     }
     
-    /**
-     * Wait for SillyTavern context to be available
-     */
     function waitForContext() {
         let attempts = 0;
         const maxAttempts = INIT_TIMEOUT / INIT_CHECK_INTERVAL;
-        
         const intervalId = setInterval(() => {
             attempts++;
             const ctx = getContext();
-            
             if (ctx) {
                 clearInterval(intervalId);
                 initialize(ctx);
             } else if (attempts >= maxAttempts) {
                 clearInterval(intervalId);
-                console.error(LOG_PREFIX, 'Failed to initialize: SillyTavern context not found');
+                console.error(LOG_PREFIX, 'Failed to find context');
             }
         }, INIT_CHECK_INTERVAL);
     }
     
-    // ============================================================================
-    // Entry Point
-    // ============================================================================
-    
-    // Wait for jQuery and start initialization
     if (typeof jQuery !== 'undefined') {
         jQuery(waitForContext);
-    } else {
-        console.error(LOG_PREFIX, 'jQuery not found, extension cannot initialize');
     }
-    
 })();

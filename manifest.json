@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "phampyk",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "homePage": "https://github.com/phampyk/SillyTavern-CharacterName",
     "description": "Allows setting a separate 'chat name' for characters that overrides the card name in chats and as {{char}}. Useful for imports with descriptive card names and ALT versions."
 }
